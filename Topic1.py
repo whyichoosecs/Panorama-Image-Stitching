@@ -98,15 +98,10 @@ class PanoramaStitcher:
             self.detector = cv2.SIFT_create()
             self.feature_type = 'sift'
     
-    def load_images(self, image_paths):
+    def load_images(self, image_paths, max_dimension=1024):
         """
-        加载图像
-        
-        参数:
-        image_paths: 图像路径列表
-        
-        返回:
-        加载的图像列表
+        加载并缩放图像
+
         """
         self.images = []
         for i, path in enumerate(image_paths):
@@ -119,12 +114,17 @@ class PanoramaStitcher:
                 print(f"Warning: Failed to load image {path}")
                 continue
                 
-            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)  # 转换为RGB
+            # 缩放图像到合理大小
+            height, width = img.shape[:2]
+            if max(height, width) > max_dimension:
+                scale = max_dimension / max(height, width)
+                new_width = int(width * scale)
+                new_height = int(height * scale)
+                img = cv2.resize(img, (new_width, new_height))
+                print(f"Resized image {i+1}: {width}x{height} -> {new_width}x{new_height}")
+            
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             self.images.append(img)
-            print(f"Loaded image {i+1}: {path}, size: {img.shape}")
-        
-        if len(self.images) < 2:
-            raise ValueError("Need at least 2 images for stitching")
         
         return self.images
     
@@ -216,47 +216,81 @@ class PanoramaStitcher:
             
             return good_matches
     
-    def compute_homography(self, kp1, kp2, matches):
+    def compute_homography(self, kp1, kp2, matches, reproj_thresh=5.0):
         """
-        使用RANSAC计算单应性矩阵
-        
-        参数:
-        kp1: 第一幅图像的关键点
-        kp2: 第二幅图像的关键点
-        matches: 匹配点
-        
-        返回:
-        单应性矩阵和内点掩码
+        使用RANSAC计算单应性矩阵 - 完全修复版
         """
+        # 调试信息
+        print(f"  compute_homography: 收到 {len(matches)} 个匹配")
+        print(f"  kp1数量: {len(kp1)}, kp2数量: {len(kp2)}")
+        
         if len(matches) < 4:
-            print(f"Warning: Only {len(matches)} matches, need at least 4")
+            print(f"匹配点不足: {len(matches)}，需要至少4个")
             return None, None
         
-        # 提取匹配点的坐标
-        src_pts = np.float32([kp1[m.queryIdx].pt for m in matches]).reshape(-1, 1, 2)
-        dst_pts = np.float32([kp2[m.trainIdx].pt for m in matches]).reshape(-1, 1, 2)
-        
-        # 使用RANSAC估计单应性矩阵
-        H, mask = cv2.findHomography(
-            src_pts, 
-            dst_pts, 
-            cv2.RANSAC, 
-            self.ransac_thresh
-        )
-        
-        # 统计内点（inliers）
-        if mask is not None:
-            inliers = mask.ravel().tolist()
-            num_inliers = sum(inliers)
-            inlier_ratio = num_inliers / len(matches)
+        try:
+            # 安全提取匹配点坐标
+            src_pts = []
+            dst_pts = []
+            valid_matches = []
             
-            print(f"  Matches: {len(matches)}, Inliers: {num_inliers}, Ratio: {inlier_ratio:.3f}")
-        else:
-            num_inliers = 0
-            inlier_ratio = 0
-            print(f"  Matches: {len(matches)}, Homography estimation failed")
-        
-        return H, mask
+            for match in matches:
+                # 检查匹配对象的类型
+                if isinstance(match, cv2.DMatch):
+                    query_idx = match.queryIdx
+                    train_idx = match.trainIdx
+                elif isinstance(match, tuple) and len(match) >= 2:
+                    query_idx, train_idx = match[0], match[1]
+                else:
+                    print(f"未知的匹配类型: {type(match)}")
+                    continue
+                
+                # 检查索引是否有效
+                if query_idx is not None and train_idx is not None:
+                    if 0 <= query_idx < len(kp1) and 0 <= train_idx < len(kp2):
+                        src_pts.append(kp1[query_idx].pt)
+                        dst_pts.append(kp2[train_idx].pt)
+                        valid_matches.append(match)
+                    else:
+                        print(f"索引越界: queryIdx={query_idx}/{len(kp1)}, trainIdx={train_idx}/{len(kp2)}")
+            
+            print(f"  ✅ 有效匹配点: {len(valid_matches)}/{len(matches)}")
+            
+            if len(src_pts) < 4:
+                print(f" 有效匹配点不足: {len(src_pts)}，需要至少4个")
+                return None, None
+            
+            # 转换为numpy数组
+            src_pts = np.float32(src_pts).reshape(-1, 1, 2)
+            dst_pts = np.float32(dst_pts).reshape(-1, 1, 2)
+            
+            # 使用RANSAC估计单应性矩阵
+            H, mask = cv2.findHomography(
+                src_pts, 
+                dst_pts, 
+                cv2.RANSAC, 
+                reproj_thresh
+            )
+            
+            if H is None:
+                print("单应性矩阵计算失败")
+                return None, None
+            
+            # 统计内点
+            if mask is not None:
+                num_inliers = np.sum(mask)
+                inlier_ratio = num_inliers / len(valid_matches) if len(valid_matches) > 0 else 0
+                print(f"内点统计: {num_inliers}/{len(valid_matches)} ({inlier_ratio:.1%})")
+            else:
+                print(f" 没有返回掩码")
+            
+            return H, mask
+            
+        except Exception as e:
+            print(f" compute_homography错误: {e}")
+            import traceback
+            traceback.print_exc()
+            return None, None
     
     def visualize_matches(self, img1, img2, kp1, kp2, matches, title="Feature Matches"):
         """可视化特征匹配"""
@@ -360,7 +394,7 @@ class PanoramaStitcher:
         transformed_corners = np.dot(H, corners_img2.T).T
         transformed_corners = transformed_corners / transformed_corners[:, 2].reshape(-1, 1)
         
-        # 计算画布大小
+        # 计算画布大小 - 转换为整数
         x_min = min(0, transformed_corners[:, 0].min())
         x_max = max(w1, transformed_corners[:, 0].max())
         y_min = min(0, transformed_corners[:, 1].min())
@@ -370,9 +404,13 @@ class PanoramaStitcher:
         translation_x = -x_min if x_min < 0 else 0
         translation_y = -y_min if y_min < 0 else 0
         
-        # 新的画布尺寸
-        canvas_width = int(x_max - x_min)
-        canvas_height = int(y_max - y_min)
+        # 新的画布尺寸 - 转换为整数
+        canvas_width = int(round(x_max - x_min))
+        canvas_height = int(round(y_max - y_min))
+        
+        # 确保平移量也是整数
+        translation_x = int(round(translation_x))
+        translation_y = int(round(translation_y))
         
         # 创建平移矩阵
         translation_matrix = np.array([
@@ -390,7 +428,21 @@ class PanoramaStitcher:
         
         # 创建img1在画布上的掩码
         img1_on_canvas = np.zeros((canvas_height, canvas_width, 3), dtype=np.uint8)
-        img1_on_canvas[translation_y:translation_y+h1, translation_x:translation_x+w1] = img1
+        
+        # 确保切片索引是整数
+        y_start = translation_y
+        y_end = translation_y + h1
+        x_start = translation_x
+        x_end = translation_x + w1
+        
+        # 确保索引在范围内
+        y_start = max(0, min(y_start, canvas_height))
+        y_end = max(0, min(y_end, canvas_height))
+        x_start = max(0, min(x_start, canvas_width))
+        x_end = max(0, min(x_end, canvas_width))
+        
+        if y_end > y_start and x_end > x_start:
+            img1_on_canvas[y_start:y_end, x_start:x_end] = img1[:y_end-y_start, :x_end-x_start]
         
         # 融合图像
         result = self._blend_images(img1_on_canvas, warped_img2)
@@ -410,7 +462,12 @@ class PanoramaStitcher:
         拼接结果
         """
         # 反转单应性矩阵
-        H_inv = np.linalg.inv(H)
+        try:
+            H_inv = np.linalg.inv(H)
+        except:
+            print("无法计算逆矩阵，使用单位矩阵")
+            H_inv = np.eye(3)
+        
         return self._warp_and_stitch_left(img2, img1, H_inv)
     
     def _blend_images(self, img1, img2):
